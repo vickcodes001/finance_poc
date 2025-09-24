@@ -53,7 +53,7 @@ app.post('/connect-account-test', async (req, res) => {
       {
         meta: { ref: uniqueRef },
         scope: 'auth',
-        redirect_url: redirectUrl
+        redirect_url: "http://localhost:5173/"
       },
       {
         headers: {

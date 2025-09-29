@@ -44,8 +44,8 @@ app.post('/connect-account-test', async (req, res) => {
 
     const redirectUrl =
       process.env.NODE_ENV === 'development'
-        ? 'http://localhost:5173/'
-        : 'https://finance-tan-delta.vercel.app/';
+        ? 'https://finance-tan-delta.vercel.app/'
+        : 'http://localhost:5173/';
 
     const response = await axios.post(
       'https://api.withmono.com/v2/accounts/initiate',

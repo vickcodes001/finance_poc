@@ -43,7 +43,6 @@ if (!process.env.MONO_WEBHOOK_SECRET) {
 app.use('/api/auth', authRoutes);
 
 // Route to initiate account connection in test mode
-// Route to initiate account connection in test mode
 app.post('/connect-account-test', async (req, res) => {
   try {
     const uniqueRef = `test_ref_${Date.now()}`;
@@ -81,14 +80,14 @@ app.post('/connect-account-test', async (req, res) => {
 // Look up an account by the customer id returned from /connect-account-test.
 // Checks Sanity first (populated by the webhook below) before falling back
 // to polling Mono directly — this replaces the old page-guessing /latest-account.
-app.get('/account-by-customer/:customerId', async (req, res) => {
-  const { customerId } = req.params;
+app.get('/account-by-ref/:ref', async (req, res) => {
+  const { ref } = req.params;
 
   try {
     // 1. check if the webhook has already delivered + we've persisted it
     const existing = await sanityClient.fetch(
-      `*[_type == "bankAccount" && customer.id == $customerId][0]`,
-      { customerId }
+      `*[_type == "bankAccount" && ref == $ref][0]`,
+      { ref }
     );
 
     if (existing) {
@@ -96,6 +95,8 @@ app.get('/account-by-customer/:customerId', async (req, res) => {
     }
 
     // 2. not persisted yet — check Mono directly in case the webhook is delayed
+    // NOTE: field name to match on here is unconfirmed — revisit once we see
+    // a real /v2/accounts listing response for a linked account.
     let account;
     let page = 1;
     let totalPages = 1;
@@ -111,7 +112,7 @@ app.get('/account-by-customer/:customerId', async (req, res) => {
         }
       );
       totalPages = data?.meta?.pages || 1;
-      account = data?.data?.find((a: any) => a.customer?.id === customerId);
+      account = data?.data?.find((a: any) => a.meta?.ref === ref);
       page++;
     } while (!account && page <= totalPages);
 
@@ -183,6 +184,7 @@ app.post('/webhook/mono', express.json(), async (req, res) => {
   console.log('📩 Verified Mono webhook:', event.event);
 
   const { event: eventType, data } = event;
+  console.log('FULL WEBHOOK PAYLOAD:', JSON.stringify(event, null, 2));
 
   // respond fast — do the (fast) persistence work, but don't block acknowledgement on it
   res.sendStatus(200);
@@ -204,6 +206,7 @@ app.post('/webhook/mono', express.json(), async (req, res) => {
         _id: `bankAccount-${account._id}`,
         _type: 'bankAccount',
         monoId: account._id,
+        ref: data?.meta?.ref ?? null,
         accountName: account.name,
         accountNumber: account.accountNumber,
         currency: account.currency,
@@ -220,7 +223,12 @@ app.post('/webhook/mono', express.json(), async (req, res) => {
           id: data?.customer ?? null,
         },
       });
-      console.log('✅ Saved account to Sanity:', account._id);
+      console.log(
+        '✅ Saved account to Sanity:',
+        account._id,
+        'ref:',
+        data?.meta?.ref
+      );
     } catch (err: any) {
       console.error('Failed to save account from webhook (FULL):', {
         message: err.message,

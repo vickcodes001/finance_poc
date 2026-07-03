@@ -34,15 +34,22 @@ if (!process.env.MONO_SECRET_KEY) {
   process.exit(1);
 }
 
+if (!process.env.MONO_WEBHOOK_SECRET) {
+  console.error('MONO_WEBHOOK_SECRET environment variable is required');
+  process.exit(1);
+}
+
 // this is to use route for users sign ups
 app.use('/api/auth', authRoutes);
 
+// Route to initiate account connection in test mode
 // Route to initiate account connection in test mode
 app.post('/connect-account-test', async (req, res) => {
   try {
     const uniqueRef = `test_ref_${Date.now()}`;
 
-    const redirectUrl = 'https://finance-tan-delta.vercel.app/';
+    const redirectUrl =
+      process.env.MONO_REDIRECT_URL || 'http://localhost:5173/';
 
     const response = await axios.post(
       'https://api.withmono.com/v2/accounts/initiate',
@@ -71,6 +78,79 @@ app.post('/connect-account-test', async (req, res) => {
   }
 });
 
+// Look up an account by the customer id returned from /connect-account-test.
+// Checks Sanity first (populated by the webhook below) before falling back
+// to polling Mono directly — this replaces the old page-guessing /latest-account.
+app.get('/account-by-customer/:customerId', async (req, res) => {
+  const { customerId } = req.params;
+
+  try {
+    // 1. check if the webhook has already delivered + we've persisted it
+    const existing = await sanityClient.fetch(
+      `*[_type == "bankAccount" && customer.id == $customerId][0]`,
+      { customerId }
+    );
+
+    if (existing) {
+      return res.json({ status: 'AVAILABLE', data: existing });
+    }
+
+    // 2. not persisted yet — check Mono directly in case the webhook is delayed
+    let account;
+    let page = 1;
+    let totalPages = 1;
+
+    do {
+      const { data } = await axios.get(
+        `https://api.withmono.com/v2/accounts?page=${page}`,
+        {
+          headers: {
+            'mono-sec-key': process.env.MONO_SECRET_KEY,
+            accept: 'application/json',
+          },
+        }
+      );
+      totalPages = data?.meta?.pages || 1;
+      account = data?.data?.find((a: any) => a.customer?.id === customerId);
+      page++;
+    } while (!account && page <= totalPages);
+
+    if (!account) {
+      return res
+        .status(202)
+        .json({ status: 'PENDING', message: 'Account not linked yet' });
+    }
+
+    const detail = await axios.get(
+      `https://api.withmono.com/v2/accounts/${account.id}`,
+      {
+        headers: {
+          'mono-sec-key': process.env.MONO_SECRET_KEY,
+          accept: 'application/json',
+        },
+      }
+    );
+
+    const status = detail.data?.meta?.data_status;
+    if (status !== 'AVAILABLE') {
+      return res.status(202).json({ status, message: 'Data still processing' });
+    }
+
+    res.json({
+      status: 'AVAILABLE',
+      data: detail.data.data.account ?? detail.data.data,
+    });
+  } catch (error: any) {
+    console.error('API Error (FULL):', {
+      message: error.message,
+      status: error.response?.status,
+      data: error.response?.data,
+      url: error.config?.url,
+    });
+    res.status(500).json({ error: error.response?.data || error.message });
+  }
+});
+
 // Add this new endpoint to get accounts first
 app.get('/accounts', async (req, res) => {
   try {
@@ -88,6 +168,76 @@ app.get('/accounts', async (req, res) => {
       error: 'Failed to fetch accounts',
       details: error.response?.data || error.message,
     });
+  }
+});
+
+app.post('/webhook/mono', express.json(), async (req, res) => {
+  const incomingSecret = req.headers['mono-webhook-secret'];
+
+  if (incomingSecret !== process.env.MONO_WEBHOOK_SECRET) {
+    console.warn('❌ Webhook rejected: secret mismatch');
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+
+  const event = req.body;
+  console.log('📩 Verified Mono webhook:', event.event);
+
+  const { event: eventType, data } = event;
+
+  // respond fast — do the (fast) persistence work, but don't block acknowledgement on it
+  res.sendStatus(200);
+
+  if (eventType === 'mono.events.account_updated') {
+    const account = data?.account;
+    const dataStatus = data?.meta?.data_status;
+
+    console.log(
+      `Account ${account?._id} status: ${dataStatus}, balance: ${account?.balance}`
+    );
+
+    if (dataStatus !== 'AVAILABLE' || !account) {
+      return; // wait for a later event once data is actually ready
+    }
+
+    try {
+      await sanityClient.createOrReplace({
+        _id: `bankAccount-${account._id}`,
+        _type: 'bankAccount',
+        monoId: account._id,
+        accountName: account.name,
+        accountNumber: account.accountNumber,
+        currency: account.currency,
+        balance: account.balance,
+        authMethod: account.authMethod,
+        bvn: account.bvn,
+        accountType: account.type,
+        institution: {
+          name: account.institution?.name,
+          type: account.institution?.type,
+          bankCode: account.institution?.bankCode,
+        },
+        customer: {
+          id: data?.customer ?? null,
+        },
+      });
+      console.log('✅ Saved account to Sanity:', account._id);
+    } catch (err: any) {
+      console.error('Failed to save account from webhook (FULL):', {
+        message: err.message,
+        statusCode: err.statusCode,
+        responseBody: err.responseBody,
+        details: err.details,
+      });
+    }
+  }
+
+  if (eventType === 'mono.events.account_connected') {
+    console.log(
+      'Account connected:',
+      data?.id,
+      'for customer:',
+      data?.customer
+    );
   }
 });
 
